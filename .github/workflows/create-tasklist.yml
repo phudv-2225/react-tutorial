@@ -1,0 +1,71 @@
+name: Create subtask issues
+run-name: "[Tasklist] ISSUE #${{ github.event.issue.number }} with labels [${{ join(github.event.issue.labels.*.name, ', ') }}]"
+
+on:
+  issues:
+    types:
+      - opened
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  ISSUE_NUMBER: ${{ github.event.issue.number }}
+  ISSUE_LABELS: ${{ join(github.event.issue.labels.*.name, ' ') }}
+  TASKLIST_HEADING: "## Planning"
+  SUB_ISSUE_LABELS: "Subtask"
+
+permissions:
+  issues: write
+  contents: read
+jobs:
+  create-tasklist:
+    if: ${{ contains(github.event.issue.labels.*.name, 'Task') }}
+    runs-on: ubuntu-latest
+    outputs:
+      issue-numbers: ${{ toJSON(steps.create-issues.outputs.*) }}
+    steps:
+      # Use checkout for loading config files
+      - uses: actions/checkout@v4
+      - id: create-issues
+        run: |
+          for type in $ISSUE_LABELS; do
+            file="./.github/workflows/tasks-$(echo $type | sed 's/.*/\L&/').txt"
+            if [ -f $file ]; then
+              tasklist=""
+              while read task; do 
+                if [[ $task == =* ]]; then
+                  echo "Reach end of task with $task"
+                  break
+                fi
+                title="#$ISSUE_NUMBER $task"
+                body=" "
+                labels=$SUB_ISSUE_LABELS
+                
+                echo "Creating issue '$title'..."
+                url="$(gh issue create --title "$title" --body "$body" --label "$labels" --repo $GITHUB_REPOSITORY)"
+                number=$(echo $url | sed 's|.*/issues/\([0-9]\+\)$|\1|')
+                echo "issue-$task=$number" >> $GITHUB_OUTPUT
+                tasklist="$tasklist\n- [ ] #$number"
+              done < $file
+              {
+                    echo 'TASKLIST<<EOF'
+                    echo -e $tasklist
+                    echo EOF
+              } >> "$GITHUB_ENV"
+
+              break
+            fi
+          done
+      - id: append-tasklist
+        if: ${{ env.TASKLIST }}
+        run: |
+          echo "Updating tasklists in parent issue #${{ env.ISSUE_NUMBER }} body..."
+          gh issue edit $ISSUE_NUMBER --body "$NEW_BODY" --repo $GITHUB_REPOSITORY
+        env:
+          NEW_BODY: "${{ github.event.issue.body }}\n${{ env.TASKLIST_HEADING }}\n${{ env.TASKLIST }}"
+  add-to-project:
+    needs: create-tasklist
+    uses: "./.github/workflows/add-issue-to-project.yml"
+    with:
+      project-number: 1
+      issue-numbers: ${{ needs.create-tasklist.outputs.issue-numbers }}
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}

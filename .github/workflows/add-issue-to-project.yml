@@ -1,0 +1,172 @@
+# This workflow runs whenever a pull request in the repository is marked as "ready for review".
+name: Add issue to project
+run-name: "Add ISSUES #${{ inputs.issue-numbers }} to project ${{ inputs.project-number }} from parent issue ${{ github.event.issue.number}}"
+
+on:
+  workflow_call:
+    inputs:
+      project-number:
+        required: true
+        type: number
+      issue-numbers:
+        required: true
+        type: string # array of number
+    secrets:
+      GH_TOKEN:
+        required: true
+
+env:
+  QUERY_LEVEL: ${{ github.event.repository.owner.type == 'User' && 'user' || 'organization' }}
+  ACCOUNT_NAME: ${{ github.repository_owner }}
+  REPOSITORY_NAME: ${{ github.event.repository.name }}
+  PARENT_VALUE: "${{ github.event.issue.title }} #${{ github.event.issue.number }}"
+  START_DATE_FIELD_NAME: "Start Date"
+  PARENT_FIELD_NAME: "Parent Task"
+  STATUS_FIELD_NAME: "Status"
+  DEFAULT_STATUS_NAME: "Todo"
+  GH_TOKEN: ${{ secrets.GH_TOKEN }}
+
+jobs:
+  get-data:
+    runs-on: ubuntu-latest
+    outputs:
+      project-id: ${{ steps.query-project.outputs.PROJECT_ID }}
+      status-field-id: ${{ steps.query-project.outputs.STATUS_FIELD_ID }}
+      start-date-field-id: ${{ steps.query-project.outputs.START_DATE_FIELD_ID }}
+      parent-field-id: ${{ steps.query-project.outputs.PARENT_FIELD_ID }}
+      status-value-id: ${{ steps.query-project.outputs.STATUS_VALUE_ID }}
+      start-date-value: ${{ steps.query-today.outputs.DATE }}
+    steps:
+      - id: query-project
+        name: Get project data
+        # Uses [GitHub CLI](https://cli.github.com/manual/) to query the API for the ID of the project and return the name and ID of the first 20 fields in the project. `fields` returns a union and the query uses inline fragments (`... on`) to return information about any `ProjectV2Field` and `ProjectV2SingleSelectField` fields. The response is stored in a file called `project_data.json`.
+        run: |
+          echo "Account type: ${{ env.QUERY_LEVEL }}"
+          echo "Account name: $ACCOUNT_NAME"
+          echo "Project number: ${{ inputs.project-number }}"
+          echo "Repository: ${{ env.REPOSITORY_NAME }}"
+          echo "Parent Task: ${{ env.PARENT_VALUE }}"
+          gh api graphql -f query='
+            query($name: String!, $number: Int!) {
+              ${{ env.QUERY_LEVEL }}(login: $name){
+                projectV2(number: $number) {
+                  id
+                  fields(first:20) {
+                    nodes {
+                      ... on ProjectV2Field {
+                        id
+                        name
+                      }
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        name
+                        options {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }' -f name=$ACCOUNT_NAME -F number=${{ inputs.project-number }} > project_data.json
+
+          echo 'PROJECT_ID='$(jq '.data.${{ env.QUERY_LEVEL }}.projectV2.id' project_data.json) >> $GITHUB_OUTPUT
+          echo 'START_DATE_FIELD_ID='$(jq '.data.${{ env.QUERY_LEVEL }}.projectV2.fields.nodes[] | select(.name== "${{ env.START_DATE_FIELD_NAME }}") | .id' project_data.json) >> $GITHUB_OUTPUT
+          echo 'PARENT_FIELD_ID='$(jq '.data.${{ env.QUERY_LEVEL }}.projectV2.fields.nodes[] | select(.name== "${{ env.PARENT_FIELD_NAME }}") | .id' project_data.json) >> $GITHUB_OUTPUT
+          echo 'STATUS_FIELD_ID='$(jq '.data.${{ env.QUERY_LEVEL }}.projectV2.fields.nodes[] | select(.name== "${{ env.STATUS_FIELD_NAME }}") | .id' project_data.json) >> $GITHUB_OUTPUT
+          echo 'STATUS_VALUE_ID='$(jq '.data.${{ env.QUERY_LEVEL }}.projectV2.fields.nodes[] | select(.name== "${{ env.STATUS_FIELD_NAME }}") | .options[] | select(.name== "${{ env.DEFAULT_STATUS_NAME }}") |.id' project_data.json) >> $GITHUB_OUTPUT
+
+      - id: query-today
+        name: Get date
+        run: echo "DATE=$(date +"%Y-%m-%d")" >> $GITHUB_OUTPUT
+
+  add-to-project:
+    needs: get-data
+    env:
+      PROJECT_ID: ${{ needs.get-data.outputs.project-id }}
+      START_DATE_FIELD_ID: ${{ needs.get-data.outputs.start-date-field-id }}
+      PARENT_FIELD_ID: ${{ needs.get-data.outputs.parent-field-id }}
+      STATUS_FIELD_ID: ${{ needs.get-data.outputs.status-field-id }}
+      STATUS_VALUE_ID: ${{ needs.get-data.outputs.status-value-id }}
+      START_DATE_VALUE: ${{ needs.get-data.outputs.start-date-value }}
+    strategy:
+      matrix:
+        issue-number: ${{ fromJSON(inputs.issue-numbers) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get issue node id
+        run: |
+          node_id="$( gh api graphql -f query='
+            query($owner: String!, $repo: String!, $issue: Int!){
+              ${{ env.QUERY_LEVEL }}(login: $owner) {
+                repository(name: $repo) {
+                  issue(number: $issue) {
+                    id
+                  }
+                }
+              }
+            }' -f owner="${{ env.ACCOUNT_NAME }}" -f repo="${{ env.REPOSITORY_NAME }}" -F issue=${{ matrix.issue-number }} --jq '.data.${{ env.QUERY_LEVEL }}.repository.issue.id')"
+          echo "Get node id of issue #${{ matrix.issue-number }}: $node_id"
+          echo 'ISSUE_ID='$node_id >> $GITHUB_ENV
+
+      - name: Add issue to project
+        # Uses [GitHub CLI](https://cli.github.com/manual/) and the API to add the pull request that triggered this workflow to the project. The `jq` flag parses the response to get the ID of the created item.
+        run: |
+          item_id="$( gh api graphql -f query='
+            mutation($project:ID!, $item:ID!) {
+              addProjectV2ItemById(input: {projectId: $project, contentId: $item}) {
+                item {
+                  id
+                }
+              }
+            }' -f project=$PROJECT_ID -f item=$ISSUE_ID --jq '.data.addProjectV2ItemById.item.id')"
+            echo "Add issue #${{ matrix.issue-number }} to project: $item_id"
+            echo 'ITEM_ID='$item_id >> $GITHUB_ENV
+
+      - name: Set fields
+        run: |
+          gh api graphql -f query='
+            mutation (
+                      $project: ID!, 
+                      $item: ID!, 
+                      $start_date_field: ID!, 
+                      $start_date_value: Date!, 
+                      $status_field: ID!, 
+                      $status_value: String!, 
+                      $parent_field: ID!, 
+                      $parent_value: String!) {
+              set_start_date: updateProjectV2ItemFieldValue(
+                input: {
+                  projectId: $project, 
+                  itemId: $item, 
+                  fieldId: $start_date_field, 
+                  value: {date: $start_date_value}}
+              ) {
+                projectV2Item {
+                  id
+                }
+              }
+              set_status: updateProjectV2ItemFieldValue(
+                input: {
+                  projectId: $project, 
+                  itemId: $item, 
+                  fieldId: $status_field, 
+                  value: {singleSelectOptionId: $status_value}}
+              ) {
+                projectV2Item {
+                  id
+                }
+              }
+              set_parent_task: updateProjectV2ItemFieldValue(
+                input: {
+                  projectId: $project, 
+                  itemId: $item, 
+                  fieldId: $parent_field, 
+                  value: {text: $parent_value}}
+              ) {
+                projectV2Item {
+                  id
+                }
+              }
+            }' -f project=${{ env.PROJECT_ID }} -f item=$ITEM_ID -f start_date_field=${{ env.START_DATE_FIELD_ID }} -f start_date_value="${{ env.START_DATE_VALUE }}" -f status_field=${{ env.STATUS_FIELD_ID }} -f status_value=${{ env.STATUS_VALUE_ID }} -f parent_field=${{ env.PARENT_FIELD_ID }} -f parent_value="${{ env.PARENT_VALUE }}" --silent
